@@ -25,6 +25,15 @@ fn log(msg: &str) {
 }
 
 #[inline]
+fn hash2(b: &[u8]) -> u32 {
+    let mut h = FxHasher::default();
+    h.write_u64(0x51_7cc1_b727_220a);
+    h.write(b);
+    let x = h.finish();
+    ((x ^ (x >> 32)).wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32
+}
+
+#[inline]
 fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = FxHasher::default();
     h.write(b);
@@ -303,12 +312,15 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 #[derive(Clone, Copy)]
 struct RawEv {
     id: S,
-    user: S,
-    product: S,
-    price: S,
-    ts: S,
+    person: S,
+    ts: i64,
     ing: i64,
-    et: u8, // 0 view 1 cart 2 purchase 255 bad
+    price: i64,
+    h: u64,
+    ph: u64,
+    cat: u16,
+    ok: bool,
+    purchase: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -450,14 +462,18 @@ fn main() {
         }
     }
     // id -> person name
-    let pname: FxHashMap<S, S> = names.iter().enumerate().map(|(i, &nm)| (nm, best[root[i] as usize])).collect();
     drop(lid);
-    let pname = Arc::new(pname);
+    let best_h: Vec<u64> = best.iter().map(|b| if b.is_empty() { 0 } else { hash_bytes(b) }).collect();
+    let mut pmap: FxHashMap<u64, (u32, u32)> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+    for i in 0..n {
+        pmap.insert(hash_bytes(names[i]), (hash2(names[i]), root[i]));
+    }
     log(&format!("links ids={}", n));
-    let person_of = |u: S| -> S {
-        match pname.get(u) {
-            Some(&p) => p,
-            None => u,
+    let person_of = |u: S| -> (S, u64) {
+        let h = hash_bytes(u);
+        match pmap.get(&h) {
+            Some(&(c, r)) if c == hash2(u) => (best[r as usize], best_h[r as usize]),
+            _ => (u, h),
         }
     };
 
@@ -477,14 +493,38 @@ fn main() {
                         Some(v) => v,
                         None => i64::MAX,
                     };
-                    let etc = match et {
+                    let etc: u8 = match et {
                         b"view" => 0,
                         b"cart" => 1,
                         b"purchase" => 2,
                         _ => 255,
                     };
-                    let h = hash_bytes(id) as usize % NB;
-                    b[h].push(RawEv { id, user, product, price, ts, ing: ingv, et: etc });
+                    let mut r = RawEv { id, person: &[], ts: 0, ing: ingv, price: 0, h: hash_bytes(id), ph: 0, cat: 0, ok: false, purchase: etc == 2 };
+                    'v: {
+                        if user.is_empty() || etc == 255 || product.is_empty() {
+                            break 'v;
+                        }
+                        let t = parse_ts(ts);
+                        if t == BAD || t < ws || t >= we {
+                            break 'v;
+                        }
+                        if etc == 2 {
+                            match parse_price(price) {
+                                Some(v) => r.price = v,
+                                None => break 'v,
+                            }
+                        }
+                        if ingv.saturating_sub(t) > DAY {
+                            break 'v;
+                        }
+                        r.ts = t;
+                        let (pp, ph) = person_of(user);
+                        r.person = pp;
+                        r.ph = ph;
+                        r.cat = *prod.get(product).unwrap_or(&unknown);
+                        r.ok = true;
+                    }
+                    b[(r.h >> 56) as usize % NB].push(r);
                 }
             });
             b
@@ -495,46 +535,44 @@ fn main() {
     let evparts: Vec<Vec<Vec<Ev>>> = (0..NB)
         .into_par_iter()
         .map(|bi| {
-            let cnt: usize = parts.iter().map(|p| p[bi].len()).sum();
-            let mut m: FxHashMap<S, RawEv> = FxHashMap::with_capacity_and_hasher(cnt, Default::default());
+            let mut keys: Vec<(u64, &RawEv)> = Vec::with_capacity(parts.iter().map(|p| p[bi].len()).sum());
             for p in &parts {
                 for r in &p[bi] {
-                    match m.get_mut(r.id) {
-                        Some(e) => {
-                            if r.ing < e.ing {
-                                *e = *r;
-                            }
-                        }
-                        None => {
-                            m.insert(r.id, *r);
-                        }
-                    }
+                    keys.push((r.h, r));
                 }
             }
-            let mut ob: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
-            for r in m.values() {
-                if r.user.is_empty() || r.et == 255 || r.product.is_empty() {
-                    continue;
+            keys.sort_unstable_by_key(|k| k.0);
+            let mut kept: Vec<RawEv> = Vec::with_capacity(keys.len());
+            let mut i = 0;
+            while i < keys.len() {
+                let mut j = i + 1;
+                while j < keys.len() && keys[j].0 == keys[i].0 {
+                    j += 1;
                 }
-                let ts = parse_ts(r.ts);
-                if ts == BAD || ts < ws || ts >= we {
-                    continue;
-                }
-                let price = if r.et == 2 {
-                    match parse_price(r.price) {
-                        Some(v) => v,
-                        None => continue,
-                    }
+                if j == i + 1 {
+                    kept.push(*keys[i].1);
                 } else {
-                    0
-                };
-                if r.ing.saturating_sub(ts) > DAY {
-                    continue;
+                    // group equal ids within the hash run
+                    let run = &mut keys[i..j];
+                    run.sort_unstable_by(|a, b| a.1.id.cmp(b.1.id).then(a.1.ing.cmp(&b.1.ing)));
+                    let mut a = 0;
+                    while a < run.len() {
+                        kept.push(*run[a].1);
+                        let mut b = a + 1;
+                        while b < run.len() && run[b].1.id == run[a].1.id {
+                            b += 1;
+                        }
+                        a = b;
+                    }
                 }
-                let person = person_of(r.user);
-                let cat = *prod.get(r.product).unwrap_or(&unknown);
-                let h = hash_bytes(person) as usize % NB;
-                ob[h].push(Ev { person, ts, price, cat, purchase: r.et == 2 });
+                i = j;
+            }
+            drop(keys);
+            let mut ob: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
+            for r in kept.iter() {
+                if r.ok {
+                    ob[r.ph as usize % NB].push(Ev { person: r.person, ts: r.ts, price: r.price, cat: r.cat, purchase: r.purchase });
+                }
             }
             ob
         })
@@ -561,8 +599,8 @@ fn main() {
                     if t == BAD || t < cws || t >= we {
                         return;
                     }
-                    let person = person_of(user);
-                    let h = hash_bytes(person) as usize % NB;
+                    let (person, ph) = person_of(user);
+                    let h = ph as usize % NB;
                     b[h].push(Clk { person, ts: t, id, camp: ci });
                 }
             });
