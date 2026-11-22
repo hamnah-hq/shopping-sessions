@@ -326,6 +326,7 @@ struct RawEv {
 #[derive(Clone, Copy)]
 struct Ev {
     person: S,
+    ph: u64,
     ts: i64,
     price: i64, // purchase price, 0 for non-purchase
     cat: u16,
@@ -335,6 +336,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 struct Clk {
     person: S,
+    ph: u64,
     ts: i64,
     id: S,
     camp: u16,
@@ -413,32 +415,35 @@ fn main() {
 
     // ------------------------------------------------ links
     let lchunks = chunks_for(&list_csv(&data.join("links")), 4 << 20);
-    let pairs: Vec<Vec<(S, S)>> = lchunks
+    let pairs: Vec<Vec<(S, S, u64, u64)>> = lchunks
         .par_iter()
         .map(|c| {
             let mut v = vec![];
             for_lines(c.data, |l| {
                 if let Some([a, b]) = split_line::<2>(l) {
                     if !a.is_empty() && !b.is_empty() {
-                        v.push((a, b));
+                        v.push((a, b, hash_bytes(a), hash_bytes(b)));
                     }
                 }
             });
             v
         })
         .collect();
-    let mut lid: FxHashMap<S, u32> = FxHashMap::default();
+    let mut lid: FxHashMap<u64, u32> = FxHashMap::default();
     let mut names: Vec<S> = vec![];
+    let mut names_h: Vec<u64> = vec![];
     let mut par: Vec<u32> = vec![];
     for v in &pairs {
-        for &(a, b) in v {
-            let ia = *lid.entry(a).or_insert_with(|| {
+        for &(a, b, ha, hb) in v {
+            let ia = *lid.entry(ha).or_insert_with(|| {
                 names.push(a);
+                names_h.push(ha);
                 par.push(par.len() as u32);
                 (par.len() - 1) as u32
             });
-            let ib = *lid.entry(b).or_insert_with(|| {
+            let ib = *lid.entry(hb).or_insert_with(|| {
                 names.push(b);
+                names_h.push(hb);
                 par.push(par.len() as u32);
                 (par.len() - 1) as u32
             });
@@ -464,15 +469,17 @@ fn main() {
     // id -> person name
     drop(lid);
     let best_h: Vec<u64> = best.iter().map(|b| if b.is_empty() { 0 } else { hash_bytes(b) }).collect();
-    let mut pmap: FxHashMap<u64, (u32, u32)> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+    let mut pmap: FxHashMap<u64, (u32, u64, S)> = FxHashMap::with_capacity_and_hasher(n, Default::default());
+    let checks: Vec<u32> = names.par_iter().map(|nm| hash2(nm)).collect();
     for i in 0..n {
-        pmap.insert(hash_bytes(names[i]), (hash2(names[i]), root[i]));
+        let r = root[i] as usize;
+        pmap.insert(names_h[i], (checks[i], best_h[r], best[r]));
     }
     log(&format!("links ids={}", n));
     let person_of = |u: S| -> (S, u64) {
         let h = hash_bytes(u);
         match pmap.get(&h) {
-            Some(&(c, r)) if c == hash2(u) => (best[r as usize], best_h[r as usize]),
+            Some(&(c, bh, b)) if c == hash2(u) => (b, bh),
             _ => (u, h),
         }
     };
@@ -483,7 +490,7 @@ fn main() {
     let parts: Vec<Vec<Vec<RawEv>>> = echunks
         .par_iter()
         .map(|c| {
-            let mut b: Vec<Vec<RawEv>> = (0..NB).map(|_| Vec::new()).collect();
+            let est = c.data.len() / 70 / NB + 16; let mut b: Vec<Vec<RawEv>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
             for_lines(c.data, |l| {
                 if let Some([id, user, ts, ing, et, product, price]) = split_line::<7>(l) {
                     if id.is_empty() {
@@ -571,7 +578,7 @@ fn main() {
             let mut ob: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
             for r in kept.iter() {
                 if r.ok {
-                    ob[r.ph as usize % NB].push(Ev { person: r.person, ts: r.ts, price: r.price, cat: r.cat, purchase: r.purchase });
+                    ob[r.ph as usize % NB].push(Ev { person: r.person, ph: r.ph, ts: r.ts, price: r.price, cat: r.cat, purchase: r.purchase });
                 }
             }
             ob
@@ -601,7 +608,7 @@ fn main() {
                     }
                     let (person, ph) = person_of(user);
                     let h = ph as usize % NB;
-                    b[h].push(Clk { person, ts: t, id, camp: ci });
+                    b[h].push(Clk { person, ph, ts: t, id, camp: ci });
                 }
             });
             b
@@ -619,13 +626,13 @@ fn main() {
         .into_par_iter()
         .map(|bi| {
             // person ids
-            let mut pid: FxHashMap<S, u32> = FxHashMap::default();
+            let mut pid: FxHashMap<u64, u32> = FxHashMap::default();
             let mut pnames: Vec<S> = vec![];
             let mut evs: Vec<(u64, u32)> = vec![]; // key (pid<<32 | ts-ws), index
             let mut evflat: Vec<Ev> = vec![];
             for p in &evparts {
                 for e in &p[bi] {
-                    let id = *pid.entry(e.person).or_insert_with(|| {
+                    let id = *pid.entry(e.ph).or_insert_with(|| {
                         pnames.push(e.person);
                         (pnames.len() - 1) as u32
                     });
@@ -636,7 +643,7 @@ fn main() {
             let mut clks: Vec<(u32, i64, S, u16)> = vec![];
             for p in &cparts {
                 for c in &p[bi] {
-                    if let Some(&id) = pid.get(c.person) {
+                    if let Some(&id) = pid.get(&c.ph) {
                         clks.push((id, c.ts, c.id, c.camp));
                     }
                 }
